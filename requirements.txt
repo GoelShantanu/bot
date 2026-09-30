@@ -1,0 +1,6 @@
+# Phase 4 (Python backtester) will use:
+pandas>=2.2
+numpy>=2.0
+
+# Tests
+pytest>=8.0

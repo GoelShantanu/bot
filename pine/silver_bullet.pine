@@ -1,0 +1,399 @@
+//@version=6
+strategy("ICT Silver Bullet", overlay=true, pyramiding=20, initial_capital=10000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1, max_bars_back=500, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// Spec: docs/strategy.md. Chart: 3m or 5m forex (EURUSD, GBPUSD, USDJPY, NZDUSD, USDCHF).
+// Pine fills use chart prices (no spread); the Python backtest models real bid/ask.
+
+// ---------- Inputs ----------
+gM = "Entry model"
+entryModel = input.string("1 SB + OTE", "Entry model", options=["1 SB + OTE", "2 SB classic", "3 SB + bias"], group=gM)
+entryLevel = input.string("CE", "Entry level in FVG", options=["CE", "Edge"], group=gM)
+biasMode = input.string("Daily DOL", "Bias (model 3 only)", options=["Daily DOL", "1h structure", "Premium/discount"], group=gM)
+requireMSS = input.bool(false, "Require market structure shift", group=gM)
+firstFvgOnly = input.bool(false, "Only first FVG per window and direction", group=gM)
+minFvgPips = input.float(0.0, "Min FVG size (pips)", minval=0.0, step=0.1, group=gM)
+sweepLookback = input.int(12, "Sweep lookback (candles)", minval=1, maxval=100, group=gM)
+legLookback = input.int(12, "Leg lookback, model 3 (candles)", minval=3, maxval=100, group=gM)
+mssLookback = input.int(10, "MSS lookback (candles)", minval=2, maxval=100, group=gM)
+oteMin = input.float(0.62, "OTE min", minval=0.0, maxval=1.0, step=0.005, group=gM)
+oteMax = input.float(0.79, "OTE max", minval=0.0, maxval=1.0, step=0.005, group=gM)
+
+gW = "Silver Bullet windows (New York time)"
+useLO = input.bool(true, "London 03:00-04:00", group=gW)
+useAM = input.bool(true, "NY AM 10:00-11:00", group=gW)
+usePM = input.bool(true, "NY PM 14:00-15:00", group=gW)
+orderExpiry = input.string("Window end", "Pending order expiry", options=["Window end", "Window end + 60 min"], group=gW)
+
+gR = "Risk and exits"
+stopMode = input.string("FVG candle 1", "Stop placement", options=["FVG candle 1", "Leg origin"], group=gR)
+stopBufferPips = input.float(1.0, "Stop buffer (pips)", minval=0.0, step=0.1, group=gR)
+minTargetPips = input.float(15.0, "Min liquidity target (pips)", minval=0.0, step=0.5, group=gR)
+minRR = input.float(2.0, "Min liquidity target (R)", minval=0.0, step=0.5, group=gR)
+targetRule = input.string("Nearest must qualify", "Liquidity target rule", options=["Nearest must qualify", "First qualifying"], group=gR)
+sdPartial = input.float(1.0, "SD level for partial", minval=0.1, step=0.1, group=gR)
+sdFinal = input.float(2.0, "SD level for final target", options=[2.0, 2.5], group=gR)
+partialPct = input.int(50, "Partial exit (%)", minval=1, maxval=99, group=gR)
+trailMode = input.string("Partial BE", "Stop management", options=["Partial BE", "BE at 1R", "BE at 1R + swing trail"], group=gR)
+riskPct = input.float(1.0, "Risk per trade (% equity)", minval=0.01, step=0.1, group=gR)
+weekendClose = input.bool(true, "Close all Friday 16:45 NY", group=gR)
+
+gL = "Liquidity levels"
+swingStrength = input.int(2, "15m swing strength (candles each side)", minval=1, maxval=10, group=gL)
+levelMaxAgeH = input.int(24, "Level max age (hours)", minval=1, maxval=120, group=gL)
+
+gV = "Visuals"
+showLevels = input.bool(true, "Show session and daily levels", group=gV)
+showSetups = input.bool(true, "Show setups", group=gV)
+showTable = input.bool(true, "Show info table", group=gV)
+
+// ---------- Constants ----------
+TZ = "America/New_York"
+pip = syminfo.mintick * 10
+buf = stopBufferPips * pip
+modelNo = entryModel == "1 SB + OTE" ? 1 : entryModel == "2 SB classic" ? 2 : 3
+
+// ---------- Time ----------
+inLO = useLO and not na(time(timeframe.period, "0300-0400:23456", TZ))
+inAM = useAM and not na(time(timeframe.period, "1000-1100:23456", TZ))
+inPM = usePM and not na(time(timeframe.period, "1400-1500:23456", TZ))
+inWindow = inLO or inAM or inPM
+nyY = year(time, TZ)
+nyMo = month(time, TZ)
+nyD = dayofmonth(time, TZ)
+winStartH = inLO ? 3 : inAM ? 10 : 14
+winStart = timestamp(TZ, nyY, nyMo, nyD, winStartH, 0)
+winEnd = timestamp(TZ, nyY, nyMo, nyD, winStartH + 1, 0)
+expiryTime = orderExpiry == "Window end" ? winEnd : winEnd + 60 * 60 * 1000
+nyMinutes = hour(time, TZ) * 60 + minute(time, TZ)
+isWeekendCut = weekendClose and dayofweek(time, TZ) == dayofweek.friday and nyMinutes >= 16 * 60 + 45
+bgcolor(inWindow ? color.new(color.yellow, 92) : na, title="Silver Bullet window")
+
+// ---------- Higher timeframe data (completed candles only) ----------
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+dOpen = request.security(syminfo.tickerid, "D", open, lookahead=barmerge.lookahead_on)
+
+f_h1dir() =>
+    ph = ta.pivothigh(high, 2, 2)
+    pl = ta.pivotlow(low, 2, 2)
+    var float lastPH = na
+    var float lastPL = na
+    var int dir = 0
+    if not na(ph)
+        lastPH := ph
+    if not na(pl)
+        lastPL := pl
+    if not na(lastPH) and close > lastPH
+        dir := 1
+        lastPH := na
+    if not na(lastPL) and close < lastPL
+        dir := -1
+        lastPL := na
+    dir[1]
+
+h1dir = request.security(syminfo.tickerid, "60", f_h1dir(), lookahead=barmerge.lookahead_on)
+[sw15H, sw15L] = request.security(syminfo.tickerid, "15", [ta.pivothigh(high, swingStrength, swingStrength)[1], ta.pivotlow(low, swingStrength, swingStrength)[1]], lookahead=barmerge.lookahead_on)
+new15 = timeframe.change("15")
+
+// ---------- Session ranges (value published when the session ends) ----------
+f_session(string sess) =>
+    inS = not na(time(timeframe.period, sess, TZ))
+    var float hi = na
+    var float lo = na
+    float doneHi = na
+    float doneLo = na
+    if inS and not inS[1]
+        hi := high
+        lo := low
+    else if inS
+        hi := math.max(hi, high)
+        lo := math.min(lo, low)
+    if not inS and inS[1]
+        doneHi := hi
+        doneLo := lo
+    [doneHi, doneLo]
+
+[asiaHi, asiaLo] = f_session("2000-2359:12345")
+[londonHi, londonLo] = f_session("0200-0500:23456")
+[nyamHi, nyamLo] = f_session("0700-1000:23456")
+
+var float asiaHiP = na
+var float asiaLoP = na
+var float londonHiP = na
+var float londonLoP = na
+if not na(asiaHi)
+    asiaHiP := asiaHi
+    asiaLoP := asiaLo
+if not na(londonHi)
+    londonHiP := londonHi
+    londonLoP := londonLo
+plot(showLevels ? pdh : na, "PDH", color=color.new(color.blue, 30), style=plot.style_stepline)
+plot(showLevels ? pdl : na, "PDL", color=color.new(color.blue, 30), style=plot.style_stepline)
+plot(showLevels ? asiaHiP : na, "Asia high", color=color.new(color.purple, 50), style=plot.style_stepline)
+plot(showLevels ? asiaLoP : na, "Asia low", color=color.new(color.purple, 50), style=plot.style_stepline)
+plot(showLevels ? londonHiP : na, "London high", color=color.new(color.teal, 50), style=plot.style_stepline)
+plot(showLevels ? londonLoP : na, "London low", color=color.new(color.teal, 50), style=plot.style_stepline)
+
+// ---------- Liquidity pool ----------
+var array<float> lvlPrice = array.new<float>()
+var array<bool> lvlIsHigh = array.new<bool>()
+var array<int> lvlTime = array.new<int>()
+
+f_add(float p, bool isHigh) =>
+    if not na(p)
+        array.push(lvlPrice, p)
+        array.push(lvlIsHigh, isHigh)
+        array.push(lvlTime, time)
+    while array.size(lvlPrice) > 120
+        array.shift(lvlPrice)
+        array.shift(lvlIsHigh)
+        array.shift(lvlTime)
+
+newDay = timeframe.change("D")
+if newDay
+    f_add(pdh, true)
+    f_add(pdl, false)
+f_add(asiaHi, true)
+f_add(asiaLo, false)
+f_add(londonHi, true)
+f_add(londonLo, false)
+f_add(nyamHi, true)
+f_add(nyamLo, false)
+if new15
+    f_add(sw15H, true)
+    f_add(sw15L, false)
+
+// Remove old levels; mark sweeps (a level is taken once price trades beyond it)
+var int lastSSLBar = na
+var int lastBSLBar = na
+maxAgeMs = levelMaxAgeH * 60 * 60 * 1000
+nLvl = array.size(lvlPrice)
+if nLvl > 0
+    for i = nLvl - 1 to 0
+        p = array.get(lvlPrice, i)
+        isH = array.get(lvlIsHigh, i)
+        tooOld = time - array.get(lvlTime, i) > maxAgeMs
+        taken = isH ? high > p : low < p
+        if taken
+            if isH
+                lastBSLBar := bar_index
+            else
+                lastSSLBar := bar_index
+        if taken or tooOld
+            array.remove(lvlPrice, i)
+            array.remove(lvlIsHigh, i)
+            array.remove(lvlTime, i)
+
+// Nearest untaken liquidity beyond entry; also the nearest one at least minDist away
+f_target(int dir, float entry, float minDist) =>
+    float nearest = na
+    float firstQ = na
+    int n = array.size(lvlPrice)
+    if n > 0
+        for i = 0 to n - 1
+            p = array.get(lvlPrice, i)
+            isH = array.get(lvlIsHigh, i)
+            if dir == 1 and isH and p > entry
+                nearest := na(nearest) ? p : math.min(nearest, p)
+                if p - entry >= minDist
+                    firstQ := na(firstQ) ? p : math.min(firstQ, p)
+            if dir == -1 and not isH and p < entry
+                nearest := na(nearest) ? p : math.max(nearest, p)
+                if entry - p >= minDist
+                    firstQ := na(firstQ) ? p : math.max(firstQ, p)
+    [nearest, firstQ]
+
+// ---------- Impulse legs ----------
+bullSweepOK = not na(lastSSLBar) and bar_index - lastSSLBar <= sweepLookback
+bearSweepOK = not na(lastBSLBar) and bar_index - lastBSLBar <= sweepLookback
+lenBull = modelNo == 3 or na(lastSSLBar) ? legLookback : math.max(3, math.min(bar_index - lastSSLBar + 1, 400))
+lenBear = modelNo == 3 or na(lastBSLBar) ? legLookback : math.max(3, math.min(bar_index - lastBSLBar + 1, 400))
+
+legLowBull = ta.lowest(low, lenBull)
+offLowBull = nz(-ta.lowestbars(low, lenBull))
+legHighBull = ta.highest(high, offLowBull + 1)
+legHighBear = ta.highest(high, lenBear)
+offHighBear = nz(-ta.highestbars(high, lenBear))
+legLowBear = ta.lowest(low, offHighBear + 1)
+
+hhRef = ta.highest(high, mssLookback)
+llRef = ta.lowest(low, mssLookback)
+mssBull = ta.highest(close, offLowBull + 1) > hhRef[offLowBull + 1]
+mssBear = ta.lowest(close, offHighBear + 1) < llRef[offHighBear + 1]
+
+// ---------- Bias (model 3) ----------
+midPD = (pdh + pdl) / 2
+bias = biasMode == "Daily DOL" ? (close > dOpen and close < pdh ? 1 : close < dOpen and close > pdl ? -1 : 0) : biasMode == "1h structure" ? h1dir : (close < midPD ? 1 : close > midPD ? -1 : 0)
+
+// ---------- Setups ----------
+type Setup
+    string id
+    int dir
+    float entry
+    float stop
+    float risk
+    float tp1
+    float tp2
+    bool single
+    int expiry
+    int createdBar
+    bool filled = false
+    bool partialDone = false
+    bool beDone = false
+
+var array<Setup> setups = array.new<Setup>()
+var int lastBullWin = na
+var int lastBearWin = na
+
+f_isOpen(string id) =>
+    bool found = false
+    int n = strategy.opentrades
+    if n > 0
+        for i = 0 to n - 1
+            if strategy.opentrades.entry_id(i) == id
+                found := true
+                break
+    found
+
+f_qty(float risk) =>
+    float conv = syminfo.currency == "USD" ? 1.0 : syminfo.basecurrency == "USD" ? 1.0 / close : 1.0
+    float riskCash = strategy.equity * riskPct / 100.0
+    math.floor(riskCash / (risk * conv))
+
+bullFVG = high[2] < low and (low - high[2]) >= minFvgPips * pip
+bearFVG = low[2] > high and (low[2] - high) >= minFvgPips * pip
+
+bullDirOK = modelNo == 3 ? bias == 1 : bullSweepOK
+bearDirOK = modelNo == 3 ? bias == -1 : bearSweepOK
+bullMSSOK = not requireMSS or mssBull
+bearMSSOK = not requireMSS or mssBear
+bullFirstOK = not firstFvgOnly or na(lastBullWin) or lastBullWin != winStart
+bearFirstOK = not firstFvgOnly or na(lastBearWin) or lastBearWin != winStart
+canTrade = barstate.isconfirmed and inWindow and not isWeekendCut and array.size(setups) < 40
+
+if canTrade and bullFVG and bullDirOK and bullMSSOK and bullFirstOK
+    zTop = low
+    zBot = high[2]
+    entry = entryLevel == "CE" ? (zTop + zBot) / 2 : zTop
+    legRange = legHighBull - legLowBull
+    r = legRange > 0 ? (legHighBull - entry) / legRange : na
+    oteOK = modelNo != 1 or (not na(r) and r >= oteMin and r <= oteMax)
+    stop = stopMode == "FVG candle 1" ? low[2] - buf : legLowBull - buf
+    risk = entry - stop
+    minDist = math.max(minTargetPips * pip, minRR * risk)
+    [nearest, firstQ] = f_target(1, entry, minDist)
+    tpLiq = targetRule == "Nearest must qualify" ? (not na(nearest) and nearest - entry >= minDist ? nearest : na) : firstQ
+    if oteOK and risk > 0 and legRange > 0 and not na(tpLiq)
+        sd1 = legHighBull + sdPartial * legRange
+        sd2 = legHighBull + sdFinal * legRange
+        single = tpLiq <= sd1
+        tp1 = single ? tpLiq : sd1
+        tp2 = single ? tpLiq : math.min(tpLiq, sd2)
+        qty = f_qty(risk)
+        if qty > 0
+            id = "L" + str.tostring(bar_index)
+            array.push(setups, Setup.new(id, 1, entry, stop, risk, tp1, tp2, single, expiryTime, bar_index))
+            strategy.entry(id, strategy.long, qty=qty, limit=entry)
+            lastBullWin := winStart
+            if showSetups
+                box.new(bar_index - 2, zTop, bar_index + 3, zBot, border_color=color.green, bgcolor=color.new(color.green, 80))
+                line.new(bar_index, entry, bar_index + 12, entry, color=color.green)
+                line.new(bar_index, stop, bar_index + 12, stop, color=color.red)
+                line.new(bar_index, tp1, bar_index + 12, tp1, color=color.blue, style=line.style_dashed)
+                if not single
+                    line.new(bar_index, tp2, bar_index + 12, tp2, color=color.blue)
+            alert("Silver Bullet BUY " + syminfo.ticker + " model " + str.tostring(modelNo) + " entry " + str.tostring(entry, format.mintick) + " stop " + str.tostring(stop, format.mintick) + " tp1 " + str.tostring(tp1, format.mintick) + " tp2 " + str.tostring(tp2, format.mintick), alert.freq_once_per_bar_close)
+
+if canTrade and bearFVG and bearDirOK and bearMSSOK and bearFirstOK
+    zTop = low[2]
+    zBot = high
+    entry = entryLevel == "CE" ? (zTop + zBot) / 2 : zBot
+    legRange = legHighBear - legLowBear
+    r = legRange > 0 ? (entry - legLowBear) / legRange : na
+    oteOK = modelNo != 1 or (not na(r) and r >= oteMin and r <= oteMax)
+    stop = stopMode == "FVG candle 1" ? high[2] + buf : legHighBear + buf
+    risk = stop - entry
+    minDist = math.max(minTargetPips * pip, minRR * risk)
+    [nearest, firstQ] = f_target(-1, entry, minDist)
+    tpLiq = targetRule == "Nearest must qualify" ? (not na(nearest) and entry - nearest >= minDist ? nearest : na) : firstQ
+    if oteOK and risk > 0 and legRange > 0 and not na(tpLiq)
+        sd1 = legLowBear - sdPartial * legRange
+        sd2 = legLowBear - sdFinal * legRange
+        single = tpLiq >= sd1
+        tp1 = single ? tpLiq : sd1
+        tp2 = single ? tpLiq : math.max(tpLiq, sd2)
+        qty = f_qty(risk)
+        if qty > 0
+            id = "S" + str.tostring(bar_index)
+            array.push(setups, Setup.new(id, -1, entry, stop, risk, tp1, tp2, single, expiryTime, bar_index))
+            strategy.entry(id, strategy.short, qty=qty, limit=entry)
+            lastBearWin := winStart
+            if showSetups
+                box.new(bar_index - 2, zTop, bar_index + 3, zBot, border_color=color.red, bgcolor=color.new(color.red, 80))
+                line.new(bar_index, entry, bar_index + 12, entry, color=color.red)
+                line.new(bar_index, stop, bar_index + 12, stop, color=color.maroon)
+                line.new(bar_index, tp1, bar_index + 12, tp1, color=color.blue, style=line.style_dashed)
+                if not single
+                    line.new(bar_index, tp2, bar_index + 12, tp2, color=color.blue)
+            alert("Silver Bullet SELL " + syminfo.ticker + " model " + str.tostring(modelNo) + " entry " + str.tostring(entry, format.mintick) + " stop " + str.tostring(stop, format.mintick) + " tp1 " + str.tostring(tp1, format.mintick) + " tp2 " + str.tostring(tp2, format.mintick), alert.freq_once_per_bar_close)
+
+// ---------- Manage pending orders and open trades ----------
+swingLow = ta.pivotlow(low, 2, 2)
+swingHigh = ta.pivothigh(high, 2, 2)
+nSet = array.size(setups)
+if nSet > 0
+    for i = nSet - 1 to 0
+        s = array.get(setups, i)
+        isNew = s.createdBar == bar_index
+        isOpen = f_isOpen(s.id)
+        bool remove = false
+        if not s.filled and isOpen
+            s.filled := true
+        if not s.filled and not isNew
+            reachedTarget = s.dir == 1 ? high >= s.tp1 : low <= s.tp1
+            invalid = s.dir == 1 ? close < s.stop : close > s.stop
+            expired = time_close >= s.expiry
+            if reachedTarget or invalid or expired or isWeekendCut
+                strategy.cancel(s.id)
+                remove := true
+        if s.filled and not isOpen
+            remove := true
+        if s.filled and isOpen
+            if not s.single and not s.partialDone and (s.dir == 1 ? high >= s.tp1 : low <= s.tp1)
+                s.partialDone := true
+                s.stop := s.dir == 1 ? math.max(s.stop, s.entry) : math.min(s.stop, s.entry)
+            if trailMode != "Partial BE" and not s.beDone and (s.dir == 1 ? high >= s.entry + s.risk : low <= s.entry - s.risk)
+                s.beDone := true
+                s.stop := s.dir == 1 ? math.max(s.stop, s.entry) : math.min(s.stop, s.entry)
+            if trailMode == "BE at 1R + swing trail" and s.beDone
+                if s.dir == 1 and not na(swingLow) and swingLow - buf > s.stop and swingLow < close
+                    s.stop := swingLow - buf
+                if s.dir == -1 and not na(swingHigh) and swingHigh + buf < s.stop and swingHigh > close
+                    s.stop := swingHigh + buf
+        if remove
+            array.remove(setups, i)
+        else
+            if s.single
+                strategy.exit(s.id + "x", from_entry=s.id, limit=s.tp1, stop=s.stop)
+            else
+                if not s.partialDone
+                    strategy.exit(s.id + "a", from_entry=s.id, qty_percent=partialPct, limit=s.tp1, stop=s.stop)
+                strategy.exit(s.id + "b", from_entry=s.id, limit=s.tp2, stop=s.stop)
+
+if isWeekendCut and strategy.opentrades > 0
+    strategy.close_all(comment="Weekend close")
+
+// ---------- Info table ----------
+var table info = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 80), border_width=1, border_color=color.gray)
+if showTable and barstate.islast
+    string winStr = inLO ? "London SB" : inAM ? "NY AM SB" : inPM ? "NY PM SB" : "outside"
+    string biasStr = bias == 1 ? "BULLISH" : bias == -1 ? "BEARISH" : "NONE"
+    table.cell(info, 0, 0, "Model", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 0, entryModel, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 1, "Window", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 1, winStr, text_color=inWindow ? color.yellow : color.gray, text_size=size.small)
+    table.cell(info, 0, 2, "Bias (" + biasMode + ")", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 2, biasStr, text_color=bias == 1 ? color.green : bias == -1 ? color.red : color.gray, text_size=size.small)
+    table.cell(info, 0, 3, "Pending / open", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 3, str.tostring(array.size(setups)) + " / " + str.tostring(strategy.opentrades), text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 4, "Liquidity levels", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 4, str.tostring(array.size(lvlPrice)), text_color=color.white, text_size=size.small)
